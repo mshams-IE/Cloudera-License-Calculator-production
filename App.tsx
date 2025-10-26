@@ -1600,13 +1600,13 @@ const App: React.FC = () => {
         }
     }, [workspace]);
 
-    const showToast = (message: string) => {
+    const showToast = useCallback((message: string) => {
         if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
         setToastMessage(message);
         toastTimeoutRef.current = window.setTimeout(() => {
             setToastMessage(null);
         }, 3000);
-    }
+    }, []);
     
     const activeSession = useMemo(() => {
         if (!workspace || !workspace.activeSessionId) return null;
@@ -1835,6 +1835,48 @@ const App: React.FC = () => {
         showToast("New calculator created!");
     };
     
+    const handleCloneSession = useCallback((sessionIdToClone: string) => {
+        setWorkspace(prev => {
+            if (!prev) return prev;
+
+            const sessionToClone = prev.sessions.find(s => s.id === sessionIdToClone);
+            if (!sessionToClone) {
+                showToast("Error: Calculator to duplicate not found.");
+                return prev;
+            }
+
+            // Deep copy
+            const newSession: Session = JSON.parse(JSON.stringify(sessionToClone));
+
+            // Set new properties
+            newSession.id = crypto.randomUUID();
+            newSession.createdAt = new Date().toISOString();
+            newSession.lastModified = new Date().toISOString();
+
+            // Create a unique name
+            let baseName = sessionToClone.name;
+            if (baseName.match(/ \(Copy( \d+)?\)$/)) {
+                baseName = baseName.replace(/ \(Copy( \d+)?\)$/, '');
+            }
+            let newName = `${baseName} (Copy)`;
+            let counter = 1;
+            while(prev.sessions.some(s => s.name === newName)) {
+                newName = `${baseName} (Copy ${++counter})`;
+            }
+            newSession.name = newName;
+
+            const updatedSessions = [...prev.sessions, newSession];
+
+            showToast(`'${sessionToClone.name}' duplicated.`);
+
+            return {
+                ...prev,
+                sessions: updatedSessions,
+                activeSessionId: newSession.id,
+            };
+        });
+    }, [showToast]);
+
     const handleSelectSession = (sessionId: string) => {
         setWorkspace(prev => prev ? ({ ...prev, activeSessionId: sessionId }) : prev);
     };
@@ -2071,6 +2113,7 @@ const App: React.FC = () => {
                 onMouseLeave={() => setIsSidebarOpen(false)}
                 onNewSession={handleNewSession} 
                 onSelectSession={handleSelectSession} 
+                onCloneSession={handleCloneSession}
                 onDeleteSession={confirmDeleteSession}
                 onUpdateSessionName={handleUpdateSessionName}
                 editingSessionId={editingSessionId}
@@ -2078,7 +2121,7 @@ const App: React.FC = () => {
                 onExportWorkspace={() => setIsExportModalOpen(true)}
                 onImportWorkspace={handleImportWorkspace}
             />
-            <div className={`flex-1 flex flex-col transition-all duration-300 ${isSidebarOpen ? 'ml-64' : 'ml-16'}`}>
+            <div className={`main-content-bg flex-1 flex flex-col transition-all duration-300 ${isSidebarOpen ? 'ml-64' : 'ml-16'}`}>
                 <header className="bg-cloudera-deep-blue/50 backdrop-blur-sm shadow-md p-4 sticky top-0 z-20 border-b border-cloudera-accent-blue/20">
                     <div className="container mx-auto flex items-center justify-between">
                         <div className="flex items-center space-x-4 flex-shrink min-w-0">
@@ -2123,13 +2166,14 @@ const Sidebar: React.FC<{
     onMouseLeave: () => void;
     onNewSession: () => void;
     onSelectSession: (id: string) => void;
+    onCloneSession: (id: string) => void;
     onDeleteSession: (session: Session) => void;
     onUpdateSessionName: (id: string, name: string) => void;
     editingSessionId: string | null;
     setEditingSessionId: (id: string | null) => void;
     onExportWorkspace: () => void;
     onImportWorkspace: (event: React.ChangeEvent<HTMLInputElement>) => void;
-}> = ({ workspace, isOpen, onMouseEnter, onMouseLeave, onNewSession, onSelectSession, onDeleteSession, onUpdateSessionName, editingSessionId, setEditingSessionId, onExportWorkspace, onImportWorkspace }) => {
+}> = ({ workspace, isOpen, onMouseEnter, onMouseLeave, onNewSession, onSelectSession, onCloneSession, onDeleteSession, onUpdateSessionName, editingSessionId, setEditingSessionId, onExportWorkspace, onImportWorkspace }) => {
     
     const sortedSessions = useMemo(() => 
         [...workspace.sessions].sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime()), 
@@ -2179,6 +2223,12 @@ const Sidebar: React.FC<{
                                 <span className="truncate flex-1">{session.name}</span>
                                 <div className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity">
                                     <button onClick={(e) => { e.stopPropagation(); setEditingSessionId(session.id); }} title="Rename" className="p-1 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path d="M17.414 2.586a2 2 0 00-2.828 0L7 10.172V13h2.828l7.586-7.586a2 2 0 000-2.828z" /><path fillRule="evenodd" d="M2 6a2 2 0 012-2h4a1 1 0 010 2H4v10h10v-4a1 1 0 112 0v4a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" clipRule="evenodd" /></svg></button>
+                                    <button onClick={(e) => { e.stopPropagation(); onCloneSession(session.id); }} title="Duplicate" className="p-1 hover:text-cloudera-orange">
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                                            <path d="M7 9a2 2 0 012-2h6a2 2 0 012 2v6a2 2 0 01-2 2H9a2 2 0 01-2-2V9z" />
+                                            <path d="M5 3a2 2 0 00-2 2v6a2 2 0 002 2V5h6a2 2 0 00-2-2H5z" />
+                                        </svg>
+                                    </button>
                                     <button onClick={(e) => { e.stopPropagation(); onDeleteSession(session); }} title="Delete" className="p-1 hover:text-red-400"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 011 1v6a1 1 0 11-2 0V9a1 1 0 011-1zm4 0a1 1 0 011 1v6a1 1 0 11-2 0V9a1 1 0 011-1z" clipRule="evenodd" /></svg></button>
                                 </div>
                             </div>
@@ -2288,9 +2338,6 @@ const DatavizTab: React.FC<{
                                         </label>
                                     ))}
                                 </div>
-                            </div>
-                             <div className="!mt-8 p-3 text-center bg-cloudera-accent-blue/20 rounded-lg text-gray-300 text-sm">
-                                <strong>Note:</strong> Cloudera Data Visualization customers who would like to use Cloudera Data Visualization with Cloudera AI must purchase Cloudera AI users (SKUs and pricing detailed in the Data Services section).
                             </div>
                         </div>
                     )}

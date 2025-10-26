@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 
 // TYPES
 enum Category {
@@ -12,7 +12,7 @@ enum Category {
   SPECIAL = 'SPECIAL',
 }
 
-type DisplayCategory = 'CDP Base' | 'Data-in-Motion' | 'Data Services';
+type DisplayCategory = 'CDP Base' | 'Data-in-Motion' | 'Data Services' | 'Data Visualization';
 type DisplaySubCategory = 'CDP Streaming' | 'DataFlow (NiFi)';
 type SupportLevel = 'Standard' | 'Business' | 'Business Select';
 type CemPackSize = '100' | '500' | '1k' | '5k' | '10k' | '30k' | '50k' | '100k';
@@ -44,6 +44,7 @@ interface NodeDisk {
   quantity: number;
   size: number;
   unit: 'GB' | 'TB';
+  isOsDisk?: boolean;
 }
 
 interface EnvironmentNode {
@@ -78,6 +79,8 @@ interface SessionAppState {
     environments: EnvironmentData[];
     environmentsState: AppState;
     activeTab: string;
+    datavizEnabled: boolean;
+    datavizSelectedEnvIds: string[];
 }
 
 interface Session {
@@ -137,6 +140,16 @@ interface CategorizedLicense extends CalculatedLicenses {
   displaySubCategory?: DisplaySubCategory;
 }
 
+type UnifiedBoqItem = {
+    isPlatform: false;
+    description: string;
+    quantities: { [envId: string]: number };
+} | {
+    isPlatform: true;
+    description: string;
+    quantity: number;
+};
+
 
 // CONSTANTS & DATA
 const GPU_MODELS = [
@@ -162,6 +175,12 @@ const SKU_DESCRIPTIONS: { [key: string]: string } = {
   'CE-OBS-OP-STD': 'Cloudera Observability On-Premises* - Standard. Cloudera Observability On-Premises is an on-premise software - Annual Subscription per Cloudera Compute Unit (CCU). Observability is licensed for the number of CCUs in the customer environment where Cloudera products are managed by Cloudera Observability. Standard Level Support.',
   'CE-OBS-OP-BUS': 'Cloudera Observability On-Premises* - Business. Cloudera Observability On-Premises is an on-premise software - Annual Subscription per Cloudera Compute Unit (CCU). Observability is licensed for the number of CCUs in the customer environment where Cloudera products are managed by Cloudera Observability. Business Level Support.',
   'CE-OBS-OP-SLT': 'Cloudera Observability On-Premises* - Business Select. Cloudera Observability On-Premises is an on-premise software - Annual Subscription per Cloudera Compute Unit (CCU). Observability is licensed for the number of CCUs in the customer environment where Cloudera products are managed by Cloudera Observability. Business Select Level Support.',
+  'COP-CDV-STD': 'Cloudera Data Visualization on premises - Platform per Customer [Limited to 500 TB of Data Under Management] - Standard Support',
+  'COP-CDV-BUS': 'Cloudera Data Visualization on premises - Platform per Customer [Limited to 500 TB of Data Under Management] - Business Support',
+  'COP-CDV-SLT': 'Cloudera Data Visualization on premises - Platform per Customer [Limited to 500 TB of Data Under Management] - Business Select Support',
+  'COP-CDV-DUM-STD': 'Additional TBs above 500TB for Cloudera Data Visualization on premises - Data Under Management - Standard Support',
+  'COP-CDV-DUM-BUS': 'Additional TBs above 500TB for Cloudera Data Visualization on premises - Data Under Management - Business Support',
+  'COP-CDV-DUM-SLT': 'Additional TBs above 500TB for Cloudera Data Visualization on premises - Data Under Management - Business Select Support',
 };
 
 const NODE_SPECS: { [key: string]: NodeSpec } = {
@@ -238,17 +257,6 @@ const getInitialState = (initialEnvs: EnvironmentData[]): AppState => {
         : Object.values(NODE_SPECS);
 
     const nodes = specsToUse.map((spec, index) => {
-        const vCPU = isObsEnv ? 16 : spec.vCPU;
-        const memory = isObsEnv ? 128 : spec.memory;
-
-        const defaultDisks: NodeDisk[] = spec.storage > 0 ? [{
-            id: crypto.randomUUID(),
-            type: 'ssd',
-            quantity: 1,
-            size: spec.storage,
-            unit: 'TB',
-        }] : [];
-      
         const node: EnvironmentNode = {
             id: spec.id,
             name: spec.name,
@@ -256,31 +264,58 @@ const getInitialState = (initialEnvs: EnvironmentData[]): AppState => {
             displayCategory: spec.displayCategory,
             displaySubCategory: spec.displaySubCategory,
             gpuConfigurable: spec.gpuConfigurable,
-            vCPU: vCPU,
-            memory: memory,
+            vCPU: isObsEnv ? 16 : spec.vCPU,
+            memory: isObsEnv ? 128 : spec.memory,
             count: env.defaultCounts[spec.id] || 0,
             order: index,
-            cpuType: 'virtual',
-            disks: defaultDisks,
+            cpuType: 'virtual', // Default
+            disks: [], // Start with empty
         };
 
+        // 1. Apply overrides for prod_y1 and dr, which includes data disks
         if (isProdY1 || isDr) {
             const overrides = PROD_Y1_NODE_OVERRIDES[spec.id];
             if (overrides) {
                 Object.assign(node, overrides);
-            }
-        } else {
-            if (spec.gpuConfigurable) {
-                node.gpuModel = 'NVIDIA T4';
-                switch (env.defaultGpu) {
-                    case '1_gpu': node.gpuQuantity = 1; break;
-                    case '2_gpu': node.gpuQuantity = 2; break;
-                    case '4_gpu': node.gpuQuantity = 4; break;
-                    default: node.gpuQuantity = 0;
-                }
+                // Ensure override disks are marked as data disks
+                node.disks = node.disks.map(d => ({ ...d, isOsDisk: false }));
             }
         }
 
+        // 2. Set default data disks IF they haven't been set by an override
+        if (node.disks.length === 0 && spec.storage > 0) {
+            node.disks = [{
+                id: crypto.randomUUID(),
+                type: 'ssd',
+                quantity: 1,
+                size: spec.storage,
+                unit: 'TB',
+                isOsDisk: false,
+            }];
+        }
+
+        // 3. Prepend OS disk based on final cpuType
+        const osDisk: NodeDisk = {
+            id: `os-${crypto.randomUUID()}`,
+            type: 'ssd',
+            quantity: node.cpuType === 'physical' ? 2 : 1,
+            size: 1,
+            unit: 'TB',
+            isOsDisk: true,
+        };
+        node.disks.unshift(osDisk);
+
+        // 4. Handle GPU for non-prod_y1/dr environments
+        if (!(isProdY1 || isDr) && spec.gpuConfigurable) {
+            node.gpuModel = 'NVIDIA T4';
+            switch (env.defaultGpu) {
+                case '1_gpu': node.gpuQuantity = 1; break;
+                case '2_gpu': node.gpuQuantity = 2; break;
+                case '4_gpu': node.gpuQuantity = 4; break;
+                default: node.gpuQuantity = 0;
+            }
+        }
+        
         return node;
     });
     
@@ -323,10 +358,12 @@ const calculateTotals = (envState: AppState[string]): { licenseTotals: LicenseTo
         const count = node.count || 0;
         if (count === 0) return;
 
-        const nodeStorageTB = node.disks.reduce((sum, disk) => {
-            const sizeInTB = disk.unit === 'TB' ? disk.size : disk.size / 1024;
-            return sum + (disk.quantity * sizeInTB);
-        }, 0);
+        const nodeStorageTB = node.disks
+            .filter(disk => !disk.isOsDisk)
+            .reduce((sum, disk) => {
+                const sizeInTB = disk.unit === 'TB' ? disk.size : disk.size / 1024;
+                return sum + (disk.quantity * sizeInTB);
+            }, 0);
         
         const hyperthreadingMultiplier = node.cpuType === 'physical' ? 2 : 1;
         const nodeTotalVCPU = count * node.vCPU * hyperthreadingMultiplier;
@@ -394,6 +431,9 @@ const getCategoryForSku = (sku: string): { displayCategory: DisplayCategory; dis
     }
     if (sku.startsWith('CDP-PVC-DTSC-') || sku.startsWith('CDP-PVC-CML-') || sku.startsWith('CDP-PVC-CGU')) {
         return { displayCategory: 'Data Services' };
+    }
+    if (sku.startsWith('COP-CDV-')) {
+        return { displayCategory: 'Data Visualization' };
     }
     return { displayCategory: 'CDP Base' }; // Fallback
 };
@@ -496,6 +536,48 @@ const calculateLicensesForEnv = (
     return licenses.filter(l => l.quantity > 0);
 };
 
+const calculateDatavizLicenses = (
+    appState: SessionAppState,
+    allCalculations: { [envId: string]: { displayTotals: DisplayTotals } }
+): CalculatedLicenses[] => {
+    const { datavizEnabled, datavizSelectedEnvIds, supportLevel } = appState;
+    if (!datavizEnabled) return [];
+
+    const licenses: CalculatedLicenses[] = [];
+    const supportSuffix = { 'Standard': 'STD', 'Business': 'BUS', 'Business Select': 'SLT' }[supportLevel];
+
+    // Platform SKU
+    const platformSku = `COP-CDV-${supportSuffix}`;
+    licenses.push({
+        sku: platformSku,
+        description: SKU_DESCRIPTIONS[platformSku],
+        quantity: 1
+    });
+    
+    // DUM SKU
+    const totalStorage = datavizSelectedEnvIds.reduce((sum, envId) => {
+        const totals = allCalculations[envId]?.displayTotals;
+        if (!totals) return sum;
+        const envTotalStorage = totals.cdpBase.storage + totals.cdpStreaming.storage + totals.dataflow.storage + totals.dataServices.master_storage + totals.dataServices.worker_storage;
+        return sum + envTotalStorage;
+    }, 0);
+
+    if (totalStorage > 500) {
+        const overage = Math.ceil(totalStorage - 500);
+        if (overage > 0) {
+            const dumSku = `COP-CDV-DUM-${supportSuffix}`;
+            licenses.push({
+                sku: dumSku,
+                description: SKU_DESCRIPTIONS[dumSku],
+                quantity: overage
+            });
+        }
+    }
+
+    return licenses;
+};
+
+
 const addObservabilityLicenses = (
     allCalculatedLicenses: { [envId: string]: CategorizedLicense[] },
     appState: SessionAppState
@@ -526,7 +608,8 @@ const addObservabilityLicenses = (
     const monitoredEnvIds = environmentsState[obsEnvId]?.monitoredEnvIds || [];
     const envsToUpdate = new Set([...monitoredEnvIds, obsEnvId]);
 
-    const newAllCalculatedLicenses = JSON.parse(JSON.stringify(allCalculatedLicenses));
+    // FIX: Add type annotation to result of JSON.parse to avoid `any` type
+    const newAllCalculatedLicenses: { [envId: string]: CategorizedLicense[] } = JSON.parse(JSON.stringify(allCalculatedLicenses));
 
     envsToUpdate.forEach(envId => {
         const targetEnvLicenses = newAllCalculatedLicenses[envId];
@@ -669,24 +752,31 @@ const EditableNodeRow: React.FC<EditableNodeRowProps> = React.memo(({ node, onNo
 
             <div>
                 <label className="text-sm font-semibold text-gray-200 mb-2 block">Disk Configuration</label>
-                <div className="space-y-2">
+                <div className="space-y-3">
                     {node.disks.map(disk => (
-                        <div key={disk.id} className="grid grid-cols-12 gap-2 items-center">
-                            <select value={disk.type} onChange={e => onDiskChange(node.id, disk.id, 'type', e.target.value)} className="col-span-3 bg-cloudera-card-bg border border-cloudera-accent-blue/40 rounded-md p-2 text-white text-sm">
-                                <option value="ssd">SSD</option><option value="hdd">HDD</option><option value="nvme">NVMe</option>
-                            </select>
-                            <input type="number" min="1" value={disk.quantity} onChange={e => onDiskChange(node.id, disk.id, 'quantity', parseInt(e.target.value, 10))} className="col-span-2 bg-cloudera-card-bg border border-cloudera-accent-blue/40 rounded-md p-2 text-white text-sm" />
-                            <span className="text-gray-300 text-center col-span-1">x</span>
-                            <input type="number" min="1" value={disk.size} onChange={e => onDiskChange(node.id, disk.id, 'size', parseInt(e.target.value, 10))} className="col-span-2 bg-cloudera-card-bg border border-cloudera-accent-blue/40 rounded-md p-2 text-white text-sm" />
-                            <select value={disk.unit} onChange={e => onDiskChange(node.id, disk.id, 'unit', e.target.value)} className="col-span-2 bg-cloudera-card-bg border border-cloudera-accent-blue/40 rounded-md p-2 text-white text-sm">
-                                <option value="GB">GB</option><option value="TB">TB</option>
-                            </select>
-                            <button onClick={() => onRemoveDisk(node.id, disk.id)} className="col-span-2 text-gray-400 hover:text-red-500" title="Remove Disk">
-                                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mx-auto" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM7 9a1 1 0 000 2h6a1 1 0 100-2H7z" clipRule="evenodd" /></svg>
-                            </button>
+                        <div key={disk.id} className={`p-3 rounded-md border ${disk.isOsDisk ? 'border-cloudera-accent-blue/30 bg-cloudera-deep-blue/20' : 'border-transparent'}`}>
+                             {disk.isOsDisk && <p className="text-xs font-semibold text-gray-400 mb-2">OS BOOT DISK</p>}
+                            <div className="grid grid-cols-12 gap-2 items-center">
+                                {disk.isOsDisk ? (
+                                    <input type="text" readOnly value="SSD / NVMe" className="col-span-3 bg-cloudera-card-bg/50 border border-cloudera-accent-blue/40 rounded-md p-2 text-gray-300 text-sm" />
+                                ) : (
+                                    <select value={disk.type} onChange={e => onDiskChange(node.id, disk.id, 'type', e.target.value)} className="col-span-3 bg-cloudera-card-bg border border-cloudera-accent-blue/40 rounded-md p-2 text-white text-sm">
+                                        <option value="ssd">SSD</option><option value="hdd">HDD</option><option value="nvme">NVMe</option>
+                                    </select>
+                                )}
+                                <input type="number" min="1" value={disk.quantity} onChange={e => onDiskChange(node.id, disk.id, 'quantity', parseInt(e.target.value, 10))} className="col-span-2 bg-cloudera-card-bg border border-cloudera-accent-blue/40 rounded-md p-2 text-white text-sm" disabled={disk.isOsDisk} />
+                                <span className="text-gray-300 text-center col-span-1">x</span>
+                                <input type="number" min="1" value={disk.size} onChange={e => onDiskChange(node.id, disk.id, 'size', parseInt(e.target.value, 10))} className="col-span-2 bg-cloudera-card-bg border border-cloudera-accent-blue/40 rounded-md p-2 text-white text-sm" />
+                                <select value={disk.unit} onChange={e => onDiskChange(node.id, disk.id, 'unit', e.target.value)} className="col-span-2 bg-cloudera-card-bg border border-cloudera-accent-blue/40 rounded-md p-2 text-white text-sm">
+                                    <option value="GB">GB</option><option value="TB">TB</option>
+                                </select>
+                                <button onClick={() => onRemoveDisk(node.id, disk.id)} className="col-span-2 text-gray-400 hover:text-red-500 disabled:opacity-50 disabled:hover:text-gray-400 disabled:cursor-not-allowed" title="Remove Disk" disabled={disk.isOsDisk}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mx-auto" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM7 9a1 1 0 000 2h6a1 1 0 100-2H7z" clipRule="evenodd" /></svg>
+                                </button>
+                            </div>
                         </div>
                     ))}
-                    <button onClick={() => onAddDisk(node.id)} className="text-sm text-cloudera-orange hover:text-orange-400">+ Add Disk</button>
+                    <button onClick={() => onAddDisk(node.id)} className="text-sm text-cloudera-orange hover:text-orange-400">+ Add Data Disk</button>
                 </div>
             </div>
         </div>
@@ -733,11 +823,11 @@ interface EnvironmentTabProps {
     onMonitoredEnvsChange: (envId: string, selectedIds: string[]) => void;
 }
 
-const LicenseTable: React.FC<{ licenses: CategorizedLicense[] }> = ({ licenses }) => {
+const LicenseTable: React.FC<{ licenses: CategorizedLicense[] | CalculatedLicenses[], title?: string }> = ({ licenses, title }) => {
     if (!licenses || licenses.length === 0) return null;
     return (
         <div className="overflow-x-auto mt-6">
-            <h4 className="text-md font-semibold text-gray-200 mb-2 border-b border-cloudera-accent-blue/20 pb-1">Required Licenses</h4>
+            <h4 className="text-md font-semibold text-gray-200 mb-2 border-b border-cloudera-accent-blue/20 pb-1">{title || 'Required Licenses'}</h4>
             <table className="w-full text-left text-sm">
                 <thead className="text-xs text-gray-300 uppercase bg-cloudera-accent-blue/10">
                     <tr>
@@ -947,52 +1037,92 @@ const getSkuSortPriority = (sku: string): number => {
     if (sku.startsWith('CDP-CFM-') || sku.startsWith('CDF-CEM-')) return 3;
     if (sku.startsWith('CDP-PVC-')) return 4;
     if (sku.startsWith('CE-OBS-OP-')) return 5;
+    if (sku.startsWith('COP-CDV-')) return 6;
     return 99; // Default for any other SKUs
 };
 
-const BoQTab: React.FC<{ allCalculatedLicenses: { [envId: string]: CalculatedLicenses[] }, environments: EnvironmentData[], environmentsState: AppState }> = ({ allCalculatedLicenses, environments, environmentsState }) => {
+const BoQTab: React.FC<{ 
+    allCalculatedLicenses: { [envId: string]: CalculatedLicenses[] }, 
+    environments: EnvironmentData[], 
+    environmentsState: AppState,
+    datavizLicenses: CalculatedLicenses[],
+    activeSessionName: string,
+}> = ({ allCalculatedLicenses, environments, environmentsState, datavizLicenses, activeSessionName }) => {
     const [isHwExportModalOpen, setIsHwExportModalOpen] = useState(false);
 
-    const boqData = useMemo(() => {
-        if (!environments || environments.length === 0) return [];
-        const allLicensesFlat: CalculatedLicenses[] = Object.values(allCalculatedLicenses).flat();
-        const uniqueLicenseTemplates = [...new Map(allLicensesFlat.map(item => [item.sku, item])).values()];
+    const unifiedBoqData = useMemo(() => {
+        const envLicensesFlat: CalculatedLicenses[] = Object.values(allCalculatedLicenses).flat();
+        const uniqueLicenseTemplates = [...new Map(envLicensesFlat.map(item => [item.sku, item])).values()];
         
-        const boq: { [sku: string]: { description: string; quantities: { [envId: string]: number } } } = {};
-        
+        const boq: { [sku: string]: UnifiedBoqItem } = {};
+
         uniqueLicenseTemplates.forEach(licenseTpl => {
-            boq[licenseTpl.sku] = { description: licenseTpl.description, quantities: {} };
+            const quantities: { [envId: string]: number } = {};
             environments.forEach(env => {
                 const license = allCalculatedLicenses[env.id]?.find(l => l.sku === licenseTpl.sku);
-                boq[licenseTpl.sku].quantities[env.id] = license ? license.quantity : 0;
+                quantities[env.id] = license ? license.quantity : 0;
             });
+            boq[licenseTpl.sku] = { 
+                isPlatform: false,
+                description: licenseTpl.description, 
+                quantities: quantities 
+            };
+        });
+
+        datavizLicenses.forEach(license => {
+            boq[license.sku] = {
+                isPlatform: true,
+                description: license.description,
+                quantity: license.quantity
+            };
         });
         
         return Object.entries(boq)
-            .filter(([_, data]) => Object.values(data.quantities).some(q => q > 0))
+            // FIX: Use 'in' operator for more robust type narrowing of the discriminated union.
+            .filter(([_, data]) => {
+                if ('quantity' in data) { // isPlatform: true case
+                    return data.quantity > 0;
+                }
+                // isPlatform: false case, data.quantities is now safe to access
+                return Object.values(data.quantities).some(q => q > 0);
+            })
             .sort(([skuA], [skuB]) => {
                 const priorityA = getSkuSortPriority(skuA);
                 const priorityB = getSkuSortPriority(skuB);
                 if (priorityA !== priorityB) {
                     return priorityA - priorityB;
                 }
-                return skuA.localeCompare(skuB); // Alphabetical sort within the same category
+                return skuA.localeCompare(skuB);
             });
 
-    }, [allCalculatedLicenses, environments]);
+    }, [allCalculatedLicenses, environments, datavizLicenses]);
 
     const handleExportBoQ = useCallback(() => {
-        const headers = ['SKU', 'Description', ...environments.map(e => e.name)];
-        const csvRows = [headers.join(',')];
+        const envHeaders = environments.map(e => e.name);
+        const headers = ['SKU', 'Description', ...envHeaders, 'Total'];
+        const csvRows: string[] = [headers.join(',')];
 
-        boqData.forEach(([sku, data]) => {
+        unifiedBoqData.forEach(([sku, data]) => {
             const row = [
                 `"${sku}"`,
-                `"${(data as any).description.replace(/"/g, '""')}"` // Escape double quotes
+                `"${data.description.replace(/"/g, '""')}"`
             ];
-            environments.forEach(env => {
-                row.push(String((data as any).quantities[env.id] || '0'));
-            });
+            
+            let total = 0;
+            // FIX: Use 'in' operator for more robust type narrowing of the discriminated union.
+            if ('quantity' in data) { // isPlatform: true case
+                envHeaders.forEach(() => row.push('')); // Add empty cells for envs
+                total = data.quantity;
+            } else {
+                // isPlatform: false case, data.quantities is now safe to access
+                envHeaders.forEach((_, index) => {
+                    const envId = environments[index].id;
+                    const qty = data.quantities[envId] || 0;
+                    row.push(String(qty));
+                    total += qty;
+                });
+            }
+            row.push(String(total));
             csvRows.push(row.join(','));
         });
 
@@ -1001,20 +1131,21 @@ const BoQTab: React.FC<{ allCalculatedLicenses: { [envId: string]: CalculatedLic
         const link = document.createElement('a');
         if (link.download !== undefined) {
             const url = URL.createObjectURL(blob);
+            const sanitizedName = activeSessionName.replace(/[^a-z0-9]/gi, '_').toLowerCase();
             link.setAttribute('href', url);
-            link.setAttribute('download', 'cloudera_boq.csv');
+            link.setAttribute('download', `${sanitizedName}_cloudera_boq.csv`);
             link.style.visibility = 'hidden';
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
         }
-    }, [boqData, environments]);
+    }, [unifiedBoqData, environments, activeSessionName]);
     
     const handleExportHwConfig = useCallback((selectedEnvIds: string[]) => {
         const headers = [
             'Environment Name', 'Node Name', 'Node Count', 'CPU Type', 'Cores/Node', 'Total vCPU',
-            'RAM/Node (GB)', 'Total RAM (GB)', 'Disk Type', 'Disk Quantity', 'Disk Size', 'Disk Unit',
-            'Total Disk (TB)', 'GPU Model', 'GPU Quantity', 'Total GPUs'
+            'RAM/Node (GB)', 'Total RAM (GB)', 'Disk Configuration', 'Total Storage/Node (TB)', 
+            'Total Storage for All Nodes (TB)', 'GPU Model', 'GPUs/Node', 'Total GPUs'
         ];
         const csvRows = [headers.join(',')];
 
@@ -1028,28 +1159,37 @@ const BoQTab: React.FC<{ allCalculatedLicenses: { [envId: string]: CalculatedLic
                     const hyperthreadingMultiplier = node.cpuType === 'physical' ? 2 : 1;
                     const totalVCPU = node.count * node.vCPU * hyperthreadingMultiplier;
                     const totalRAM = node.count * node.memory;
-                    const totalGpu = node.count * (node.gpuQuantity || 0);
                     
-                    if (node.disks.length > 0) {
-                        node.disks.forEach(disk => {
-                            const sizeInTB = disk.unit === 'TB' ? disk.size : disk.size / 1024;
-                            const totalDiskTB = node.count * disk.quantity * sizeInTB;
-                            const row = [
-                                `"${envData.name}"`, `"${node.name}"`, node.count, node.cpuType, node.vCPU, totalVCPU,
-                                node.memory, totalRAM, disk.type, disk.quantity, disk.size, disk.unit,
-                                totalDiskTB, `"${node.gpuModel || '-'}"`, node.gpuQuantity || 0, totalGpu
-                            ];
-                            csvRows.push(row.join(','));
-                        });
-                    } else {
-                        // Node with no disks
-                        const row = [
-                            `"${envData.name}"`, `"${node.name}"`, node.count, node.cpuType, node.vCPU, totalVCPU,
-                            node.memory, totalRAM, '-', 0, 0, '-', 0,
-                            `"${node.gpuModel || '-'}"`, node.gpuQuantity || 0, totalGpu
-                        ];
-                        csvRows.push(row.join(','));
-                    }
+                    const diskConfigString = node.disks.map(disk => 
+                        `${disk.quantity} x ${disk.size}${disk.unit} ${disk.type.toUpperCase()}`
+                    ).join(', ') || '-';
+
+                    const totalStoragePerNodeTB = node.disks.reduce((sum, disk) => {
+                        const sizeInTB = disk.unit === 'TB' ? disk.size : disk.size / 1024;
+                        return sum + (disk.quantity * sizeInTB);
+                    }, 0);
+
+                    const totalStorageAllNodesTB = node.count * totalStoragePerNodeTB;
+                    
+                    const totalGpu = node.count * (node.gpuQuantity || 0);
+
+                    const row = [
+                        `"${envData.name}"`,
+                        `"${node.name}"`,
+                        node.count,
+                        node.cpuType,
+                        node.vCPU,
+                        totalVCPU,
+                        node.memory,
+                        totalRAM,
+                        `"${diskConfigString}"`,
+                        totalStoragePerNodeTB.toFixed(2),
+                        totalStorageAllNodesTB.toFixed(2),
+                        `"${node.gpuModel || '-'}"`,
+                        node.gpuQuantity || 0,
+                        totalGpu
+                    ];
+                    csvRows.push(row.join(','));
                 }
             });
         });
@@ -1058,14 +1198,15 @@ const BoQTab: React.FC<{ allCalculatedLicenses: { [envId: string]: CalculatedLic
         const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
         const link = document.createElement('a');
         const url = URL.createObjectURL(blob);
+        const sanitizedName = activeSessionName.replace(/[^a-z0-9]/gi, '_').toLowerCase();
         link.setAttribute('href', url);
-        link.setAttribute('download', 'cloudera_hw_config.csv');
+        link.setAttribute('download', `${sanitizedName}_cloudera_hw_config.csv`);
         link.style.visibility = 'hidden';
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
         setIsHwExportModalOpen(false);
-    }, [environments, environmentsState]);
+    }, [environments, environmentsState, activeSessionName]);
 
 
     if (!environments || environments.length === 0) {
@@ -1079,7 +1220,7 @@ const BoQTab: React.FC<{ allCalculatedLicenses: { [envId: string]: CalculatedLic
     }
 
     return (
-        <div className="p-4 md:p-8">
+        <div className="p-4 md:p-8 space-y-8">
             {isHwExportModalOpen && (
                 <HwExportModal 
                     environments={environments}
@@ -1115,17 +1256,24 @@ const BoQTab: React.FC<{ allCalculatedLicenses: { [envId: string]: CalculatedLic
                             </tr>
                         </thead>
                         <tbody className="bg-cloudera-card-bg/50">
-                            {boqData.map(([sku, data]) => (
+                            {unifiedBoqData.map(([sku, data]) => (
                                 <tr key={sku} className="border-b border-cloudera-accent-blue/20 hover:bg-cloudera-accent-blue/10">
                                     <td className="p-3 font-mono align-top break-words">{sku}</td>
-                                    <td className="p-3 align-top break-words">{(data as any).description}</td>
-                                    {environments.map(env => (
-                                         <td key={env.id} className="p-3 text-center font-mono font-bold text-lg align-top" style={{ backgroundColor: env.type === 'prod' ? 'rgba(247, 109, 11, 0.08)' : 'rgba(56, 189, 248, 0.08)'}}>
-                                            <span style={{color: ((data as any).quantities[env.id] || 0) > 0 ? (env.type === 'prod' ? '#F76D0B' : '#38bdf8') : 'inherit' }}>
-                                              {((data as any).quantities[env.id] || 0) > 0 ? ((data as any).quantities[env.id] || 0).toLocaleString() : '-'}
-                                            </span>
+                                    <td className="p-3 align-top break-words">{data.description}</td>
+                                    {/*// FIX: Use 'in' operator for more robust type narrowing of the discriminated union in JSX.*/}
+                                    {'quantity' in data ? (
+                                        <td colSpan={environments.length} className="p-3 text-center font-mono font-bold text-lg align-top">
+                                             <span className="text-cloudera-orange">{data.quantity.toLocaleString()}</span>
                                         </td>
-                                    ))}
+                                    ) : (
+                                        environments.map(env => (
+                                             <td key={env.id} className="p-3 text-center font-mono font-bold text-lg align-top" style={{ backgroundColor: env.type === 'prod' ? 'rgba(247, 109, 11, 0.08)' : 'rgba(56, 189, 248, 0.08)'}}>
+                                                <span style={{color: (data.quantities[env.id] || 0) > 0 ? (env.type === 'prod' ? '#F76D0B' : '#38bdf8') : 'inherit' }}>
+                                                  {(data.quantities[env.id] || 0) > 0 ? (data.quantities[env.id] || 0).toLocaleString() : '-'}
+                                                </span>
+                                            </td>
+                                        ))
+                                    )}
                                 </tr>
                             ))}
                         </tbody>
@@ -1308,10 +1456,20 @@ const createNewEnvironment = (name: string): { envData: EnvironmentData, envStat
         id: newId, name: name, type: 'prod', nodes: Object.values(NODE_SPECS), defaultCounts: {}, defaultGpu: 'no_gpu',
     };
     const nodes = Object.values(NODE_SPECS).map((spec, index) => {
-        const defaultDisks: NodeDisk[] = spec.storage > 0 ? [{ id: crypto.randomUUID(), type: 'ssd', quantity: 1, size: spec.storage, unit: 'TB' }] : [];
+        const dataDisks: NodeDisk[] = spec.storage > 0 ? [{ id: crypto.randomUUID(), type: 'ssd', quantity: 1, size: spec.storage, unit: 'TB', isOsDisk: false }] : [];
+        const cpuType: 'physical' | 'virtual' = 'virtual';
+        const osDisk: NodeDisk = {
+            id: `os-${crypto.randomUUID()}`,
+            type: 'ssd',
+            // FIX: Correctly access cpuType for quantity calculation. Since cpuType is always 'virtual' here, the quantity is always 1.
+            quantity: 1,
+            size: 1,
+            unit: 'TB',
+            isOsDisk: true,
+        };
         const node: EnvironmentNode = {
             id: spec.id, name: spec.name, category: spec.category, displayCategory: spec.displayCategory, displaySubCategory: spec.displaySubCategory,
-            gpuConfigurable: spec.gpuConfigurable, vCPU: spec.vCPU, memory: spec.memory, count: 0, order: index, cpuType: 'virtual', disks: defaultDisks,
+            gpuConfigurable: spec.gpuConfigurable, vCPU: spec.vCPU, memory: spec.memory, count: 0, order: index, cpuType, disks: [osDisk, ...dataDisks],
         };
         if (spec.gpuConfigurable) { node.gpuModel = 'NVIDIA T4'; node.gpuQuantity = 0; }
         return node;
@@ -1320,19 +1478,22 @@ const createNewEnvironment = (name: string): { envData: EnvironmentData, envStat
     return { envData, envState };
 };
 
-const createDefaultSession = (name = "customer-opportunity xx workspace"): Session => {
+const createDefaultSession = (name?: string): Session => {
     const defaultEnvs = ENVIRONMENTS_DATA;
     const defaultEnvStates = getInitialState(defaultEnvs);
+    const sessionName = name || `[Customer Name].[Opportunity Name].Calculator (${new Date().toLocaleDateString()})`;
     return {
         id: crypto.randomUUID(),
-        name,
+        name: sessionName,
         createdAt: new Date().toISOString(),
         lastModified: new Date().toISOString(),
         appState: {
             environments: defaultEnvs,
             environmentsState: defaultEnvStates,
             activeTab: defaultEnvs[0]?.id || 'boq',
-            supportLevel: 'Business'
+            supportLevel: 'Business',
+            datavizEnabled: false,
+            datavizSelectedEnvIds: [],
         }
     }
 };
@@ -1344,6 +1505,15 @@ const loadWorkspaceFromStorage = (): Workspace => {
         if (savedWorkspace) {
             const parsed = JSON.parse(savedWorkspace);
             delete parsed.sidebarCollapsed; // remove old property if it exists
+            // ensure all sessions have new dataviz properties
+            parsed.sessions.forEach((s: Session) => {
+                if (s.appState.datavizEnabled === undefined) {
+                    s.appState.datavizEnabled = false;
+                }
+                if (s.appState.datavizSelectedEnvIds === undefined) {
+                    s.appState.datavizSelectedEnvIds = [];
+                }
+            });
             return parsed;
         }
     } catch (e) { console.error("Failed to parse workspace from localStorage", e); }
@@ -1365,6 +1535,8 @@ const loadWorkspaceFromStorage = (): Workspace => {
                 environments,
                 environmentsState,
                 activeTab: activeTab || environments[0]?.id || 'boq',
+                datavizEnabled: false,
+                datavizSelectedEnvIds: [],
             };
             
             const migratedWorkspace: Workspace = {
@@ -1489,7 +1661,22 @@ const App: React.FC = () => {
 
     const handleNodeChange = useCallback((envId: string, nodeId: string, field: keyof EnvironmentNode, value: any) => {
         updateActiveSession(session => {
-            const newEnvState = { ...session.appState.environmentsState[envId], nodes: session.appState.environmentsState[envId].nodes.map(n => n.id === nodeId ? { ...n, [field]: value } : n) };
+            let newNodes = session.appState.environmentsState[envId].nodes.map(n => n.id === nodeId ? { ...n, [field]: value } : n);
+            
+            // Auto-update OS Disk quantity when CPU type changes
+            if (field === 'cpuType') {
+                newNodes = newNodes.map(n => {
+                    if (n.id === nodeId) {
+                        return {
+                            ...n,
+                            disks: n.disks.map(d => d.isOsDisk ? { ...d, quantity: value === 'physical' ? 2 : 1 } : d)
+                        };
+                    }
+                    return n;
+                });
+            }
+
+            const newEnvState = { ...session.appState.environmentsState[envId], nodes: newNodes };
             return { ...session, lastModified: new Date().toISOString(), appState: { ...session.appState, environmentsState: { ...session.appState.environmentsState, [envId]: newEnvState } } };
         });
     }, [updateActiveSession]);
@@ -1499,6 +1686,14 @@ const App: React.FC = () => {
             const newEnvState = { ...session.appState.environmentsState[envId], [field]: value };
             return { ...session, lastModified: new Date().toISOString(), appState: { ...session.appState, environmentsState: { ...session.appState.environmentsState, [envId]: newEnvState } } };
         });
+    }, [updateActiveSession]);
+    
+    const handleDatavizChange = useCallback((field: 'datavizEnabled' | 'datavizSelectedEnvIds', value: any) => {
+        updateActiveSession(session => ({
+            ...session,
+            lastModified: new Date().toISOString(),
+            appState: { ...session.appState, [field]: value }
+        }));
     }, [updateActiveSession]);
 
     const handleMonitoredEnvsChange = useCallback((envId: string, selectedIds: string[]) => {
@@ -1517,7 +1712,7 @@ const App: React.FC = () => {
     }, [updateActiveSession]);
     
     const handleAddDisk = useCallback((envId: string, nodeId: string) => {
-        const newDisk: NodeDisk = { id: crypto.randomUUID(), type: 'ssd', quantity: 1, size: 512, unit: 'GB' };
+        const newDisk: NodeDisk = { id: crypto.randomUUID(), type: 'ssd', quantity: 1, size: 512, unit: 'GB', isOsDisk: false };
         updateActiveSession(session => {
             const newNodes = session.appState.environmentsState[envId].nodes.map(n => n.id === nodeId ? { ...n, disks: [...n.disks, newDisk] } : n)
             const newEnvState = { ...session.appState.environmentsState[envId], nodes: newNodes };
@@ -1622,7 +1817,16 @@ const App: React.FC = () => {
 
     // Workspace/Session handlers
     const handleNewSession = () => {
-        const newSession = createDefaultSession(`New Calculator ${workspace ? workspace.sessions.length + 1 : 1}`);
+        const baseName = `[Customer Name].[Opportunity Name].Calculator (${new Date().toLocaleDateString()})`;
+        let newName = baseName;
+        let counter = 1;
+        if (workspace) {
+            // Ensure name is unique
+            while(workspace.sessions.some(s => s.name === newName)) {
+                newName = `${baseName} (${++counter})`;
+            }
+        }
+        const newSession = createDefaultSession(newName);
         setWorkspace(prev => ({
             ...(prev ?? { sessions: [] }),
             activeSessionId: newSession.id,
@@ -1798,6 +2002,12 @@ const App: React.FC = () => {
         return results;
     }, [activeSession]);
 
+    const datavizLicenses = useMemo(() => {
+        if (!activeSession) return [];
+        return calculateDatavizLicenses(activeSession.appState, allCalculations);
+    }, [activeSession, allCalculations]);
+
+
     if (!workspace || !activeSession) {
         return <div className="bg-cloudera-deep-blue min-h-screen flex items-center justify-center text-white">Loading Workspace...</div>;
     }
@@ -1806,13 +2016,18 @@ const App: React.FC = () => {
     
     const TAB_NAMES: { [key: string]: string } = {
       ...environments.reduce((acc, e) => ({ ...acc, [e.id]: e.name }), {}),
+      'dataviz': 'Dataviz',
       'boq': 'Bill of Quantities (BoQ)'
     };
 
     const renderContent = () => {
         if (activeTab === 'boq') {
-            const allLicenses = Object.entries(allCalculations).reduce((acc, [envId, calc]) => { (acc as any)[envId] = calc.licenses; return acc; }, {} as { [envId: string]: CalculatedLicenses[] });
-            return <BoQTab allCalculatedLicenses={allLicenses} environments={environments} environmentsState={environmentsState} />;
+            // FIX: Add type assertion to `calc` to fix type inference issue
+            const allLicenses = Object.entries(allCalculations).reduce((acc, [envId, calc]) => { (acc as any)[envId] = (calc as { licenses: CategorizedLicense[] }).licenses; return acc; }, {} as { [envId: string]: CalculatedLicenses[] });
+            return <BoQTab allCalculatedLicenses={allLicenses} environments={environments} environmentsState={environmentsState} datavizLicenses={datavizLicenses} activeSessionName={activeSession.name}/>;
+        }
+        if (activeTab === 'dataviz') {
+            return <DatavizTab appState={activeSession.appState} onDatavizChange={handleDatavizChange} />;
         }
         const envData = environments.find(e => e.id === activeTab);
         if (envData && environmentsState[activeTab] && allCalculations[activeTab]) {
@@ -2017,10 +2232,71 @@ const TabNavigation: React.FC<{
                         </div>
                     ))}
                     <button onClick={onAddNewTab} title="Add New Environment" className="py-3 px-2 text-gray-400 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clipRule="evenodd" /></svg></button>
+                    <div key="dataviz" className="group relative flex items-center flex-shrink-0"><button onClick={() => onSetActiveTab('dataviz')} className={`py-3 px-4 text-sm font-medium whitespace-nowrap border-b-2 focus:outline-none transition-colors duration-200 ${activeTab === 'dataviz' ? 'border-cloudera-orange text-cloudera-orange' : 'border-transparent text-gray-300 hover:text-white hover:border-cloudera-accent-blue/70'}`}>{TAB_NAMES['dataviz']}</button></div>
                     <div key="boq" className="group relative flex items-center flex-shrink-0"><button onClick={() => onSetActiveTab('boq')} className={`py-3 px-4 text-sm font-medium whitespace-nowrap border-b-2 focus:outline-none transition-colors duration-200 ${activeTab === 'boq' ? 'border-cloudera-orange text-cloudera-orange' : 'border-transparent text-gray-300 hover:text-white hover:border-cloudera-accent-blue/70'}`}>{TAB_NAMES['boq']}</button></div>
                 </div>
             </div>
         </nav>
+    );
+};
+
+const DatavizTab: React.FC<{
+    appState: SessionAppState;
+    onDatavizChange: (field: 'datavizEnabled' | 'datavizSelectedEnvIds', value: any) => void;
+}> = ({ appState, onDatavizChange }) => {
+    const { datavizEnabled, datavizSelectedEnvIds, environments } = appState;
+
+    const handleEnvToggle = (envId: string) => {
+        const newIds = new Set(datavizSelectedEnvIds);
+        if (newIds.has(envId)) {
+            newIds.delete(envId);
+        } else {
+            newIds.add(envId);
+        }
+        onDatavizChange('datavizSelectedEnvIds', Array.from(newIds));
+    };
+
+    return (
+        <div className="p-4 md:p-8">
+            <Card title="Cloudera Data Visualization (CDV)">
+                <div className="space-y-6">
+                    <div>
+                        <label className="flex items-center justify-between text-lg text-white cursor-pointer">
+                            <span>Would you like to add Cloudera Data Visualization license?</span>
+                            <div className="relative inline-flex items-center">
+                                <input type="checkbox" checked={datavizEnabled} onChange={e => onDatavizChange('datavizEnabled', e.target.checked)} className="sr-only peer" />
+                                <div className="w-11 h-6 bg-cloudera-deep-blue peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-cloudera-orange rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cloudera-orange"></div>
+                            </div>
+                        </label>
+                    </div>
+
+                    {datavizEnabled && (
+                        <div className="border-t border-cloudera-accent-blue/20 pt-6 space-y-4">
+                            <div>
+                                <h3 className="text-md font-semibold text-gray-200 mb-2">Select Environments</h3>
+                                <p className="text-sm text-gray-400 mb-3">Select the environments whose storage should be counted towards the 500 TB Data Under Management limit for CDV.</p>
+                                <div className="space-y-2 max-h-60 overflow-y-auto pr-2">
+                                    {environments.map(env => (
+                                        <label key={env.id} className="flex items-center p-2 rounded-md bg-cloudera-deep-blue/50 cursor-pointer hover:bg-cloudera-accent-blue/20">
+                                            <input
+                                                type="checkbox"
+                                                checked={datavizSelectedEnvIds.includes(env.id)}
+                                                onChange={() => handleEnvToggle(env.id)}
+                                                className="h-4 w-4 rounded bg-cloudera-card-bg border-cloudera-accent-blue text-cloudera-orange focus:ring-cloudera-orange"
+                                            />
+                                            <span className="ml-3 text-white">{env.name}</span>
+                                        </label>
+                                    ))}
+                                </div>
+                            </div>
+                             <div className="!mt-8 p-3 text-center bg-cloudera-accent-blue/20 rounded-lg text-gray-300 text-sm">
+                                <strong>Note:</strong> Cloudera Data Visualization customers who would like to use Cloudera Data Visualization with Cloudera AI must purchase Cloudera AI users (SKUs and pricing detailed in the Data Services section).
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </Card>
+        </div>
     );
 };
 

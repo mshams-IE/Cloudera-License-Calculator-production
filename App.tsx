@@ -1570,7 +1570,6 @@ const App: React.FC = () => {
     const [workspaceToImport, setWorkspaceToImport] = useState<string | null>(null);
     const [isExportModalOpen, setIsExportModalOpen] = useState(false);
     const toastTimeoutRef = useRef<number | null>(null);
-    const escapePressed = useRef(false);
 
     useEffect(() => {
         setWorkspace(loadWorkspaceFromStorage());
@@ -1882,14 +1881,32 @@ const App: React.FC = () => {
         setWorkspace(prev => prev ? ({ ...prev, activeSessionId: sessionId }) : prev);
     };
 
-    const handleUpdateSessionName = (sessionId: string, newName: string) => {
+    const handleUpdateSessionName = useCallback((sessionId: string, newName: string) => {
+        // We are trying to commit a name change. We should always exit editing mode afterwards.
+        // React batches these state updates, so the UI change will be smooth.
+        setEditingSessionId(null);
+
+        const trimmedName = newName.trim();
+        if (!trimmedName) {
+            showToast("Calculator name cannot be empty.");
+            return; // Exit, editing mode is already scheduled to be turned off.
+        }
+
         setWorkspace(prev => {
             if (!prev) return prev;
-            const newSessions = prev.sessions.map(s => s.id === sessionId ? {...s, name: newName, lastModified: new Date().toISOString()} : s);
+            
+            const session = prev.sessions.find(s => s.id === sessionId);
+            // If the name hasn't changed, no need to update the workspace.
+            if (session && session.name === trimmedName) {
+                return prev; 
+            }
+            
+            const newSessions = prev.sessions.map(s => 
+                s.id === sessionId ? { ...s, name: trimmedName, lastModified: new Date().toISOString() } : s
+            );
             return { ...prev, sessions: newSessions };
         });
-        setEditingSessionId(null);
-    };
+    }, [showToast]);
     
     const confirmDeleteSession = (session: Session) => {
         setSessionToDelete(session);
@@ -1961,7 +1978,7 @@ const App: React.FC = () => {
             console.error("Failed to export workspace", error);
             showToast("Error exporting workspace.");
         }
-    }, [workspace]);
+    }, [workspace, showToast]);
 
 
     const handleImportWorkspace = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1980,7 +1997,7 @@ const App: React.FC = () => {
         };
         reader.readAsText(file);
         event.target.value = ''; // Reset input so same file can be loaded again
-    }, []);
+    }, [showToast]);
     
     const executeImport = useCallback(() => {
         if (!workspaceToImport) return;
@@ -2013,7 +2030,7 @@ const App: React.FC = () => {
         } finally {
             setWorkspaceToImport(null);
         }
-    }, [workspaceToImport]);
+    }, [workspaceToImport, showToast]);
 
 
     const allCalculations = useMemo(() => {
@@ -2133,18 +2150,12 @@ const App: React.FC = () => {
                                     autoFocus
                                     onKeyDown={(e) => {
                                         if (e.key === 'Enter') {
-                                            e.currentTarget.blur();
+                                            handleUpdateSessionName(activeSession.id, e.currentTarget.value);
                                         } else if (e.key === 'Escape') {
-                                            escapePressed.current = true;
-                                            e.currentTarget.blur();
+                                            setEditingSessionId(null);
                                         }
                                     }}
                                     onBlur={(e) => {
-                                        if (escapePressed.current) {
-                                            escapePressed.current = false;
-                                            setEditingSessionId(null);
-                                            return;
-                                        }
                                         handleUpdateSessionName(activeSession.id, e.target.value);
                                     }}
                                     className="text-2xl font-bold w-full text-gray-50 bg-cloudera-card-bg/50 outline-none ring-2 ring-cloudera-orange rounded px-2 py-1"
@@ -2246,13 +2257,19 @@ const Sidebar: React.FC<{
             <nav className={`flex-1 overflow-y-auto p-2 space-y-1 transition-opacity duration-200 ${isOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
                 {sortedSessions.map(session => (
                     <div key={session.id} className="group relative">
-                        {editingSessionId === session.id ? (
+                        {(editingSessionId === session.id && workspace.activeSessionId !== session.id) ? (
                              <input 
                                 type="text"
                                 defaultValue={session.name}
                                 autoFocus
                                 onBlur={(e) => onUpdateSessionName(session.id, e.target.value)}
-                                onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                        onUpdateSessionName(session.id, e.currentTarget.value);
+                                    } else if (e.key === 'Escape') {
+                                        setEditingSessionId(null);
+                                    }
+                                }}
                                 className="w-full text-sm font-medium bg-cloudera-card-bg text-white outline-none ring-2 ring-cloudera-orange rounded px-3 py-2"
                             />
                         ) : (
